@@ -233,14 +233,29 @@ func callChatAPI(ctx context.Context, texts []string, baseURL, apiKey, model str
 	}
 	jsonBytes, _ := json.Marshal(payload)
 
-	system := "你是一个专业的日文→简体中文翻译器。请严格保留技术术语、SKU、IP地址、端口号等不变。只把自然语言部分翻译成中文。"
-	user := fmt.Sprintf(`请将下面这些文本全部翻译成简体中文。
+	system := `你是一个专门负责 Azure 技术文档翻译的助手，负责将「日文」翻译成「简体中文」。
 
-要求：
-1. 返回 JSON 对象，key 为原文字符串，value 为翻译后的中文字符串。
-2. 不要添加任何额外说明或注释，只返回 JSON。
+【背景】
+- 这些字符串来自 Azure 各类组件（例如 Application Gateway、Public IP、Virtual Network、Auto-scaling、SKU、可用性区域等）的「配置 / 购买参数说明」Excel 文档。
+- 每一条字符串通常是：字段名、选项名称、帮助说明、参数解释、默认值说明等。
 
-待翻译数据（JSON）：
+【必须严格遵守的规则】
+1. 只翻译其中的「日文」部分为简体中文。
+2. 所有英文单词必须原样保留，不要翻译、不要修改，也不要意译。
+   （包括但不限于：Azure 服务名、SKU 名、协议名、IP 类型、参数名、选项值，如 Application Gateway、Public IP、Virtual Network、Standard_v2、WAF_v2、HTTP、HTTPS、TCP、ZoneRedundant 等）
+3. 所有数字、符号、括号、标点、结构都必须保持不变（例如 (), [], {}, :, ., /, -, 空格 等）。
+4. 不要增删内容，不要重排结构，只在原位置上将日文替换为对应的中文表达。
+5. 如果某个字符串完全由英文、数字和符号构成（没有日文），请原样返回，不要改动。
+6. 最终输出必须是合法的 JSON 对象：{"原文字符串": "翻译后的字符串", ...}，不要输出任何解释、注释或多余文字。`
+
+	user := fmt.Sprintf(`下面是一个 JSON 对象，其中包含一个 "texts" 字段，里面是若干待翻译的字符串。
+
+请对其中每个字符串进行处理：
+- 只翻译日文为简体中文；
+- 英文、数字、符号、Azure 技术名词、SKU、IP 等全部保持不变；
+- 按「原文 → 译文」的方式，返回一个 JSON 对象。
+
+输入 JSON 如下：
 %s`, string(jsonBytes))
 
 	reqBody := chatRequest{
@@ -249,6 +264,7 @@ func callChatAPI(ctx context.Context, texts []string, baseURL, apiKey, model str
 			{Role: "system", Content: system},
 			{Role: "user", Content: user},
 		},
+		// 要求模型直接返回 JSON 对象
 		ResponseFormat: &responseShape{Type: "json_object"},
 	}
 
