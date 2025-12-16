@@ -2,7 +2,10 @@ module translate
 
 go 1.25.1
 
-require github.com/xuri/excelize/v2 v2.10.0
+require (
+	baliance.com/gooxml v1.0.1
+	github.com/xuri/excelize/v2 v2.10.0
+)
 
 require (
 	github.com/richardlehane/mscfb v1.0.4 // indirect
