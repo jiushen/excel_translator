@@ -9,7 +9,7 @@ import (
 )
 
 // translateExcel: Excel-only translation flow (no main here).
-func translateExcel(input, output string) error {
+func translateExcel(input, output string, dir Direction) error {
 	f, err := excelize.OpenFile(input)
 	if err != nil {
 		return fmt.Errorf("打开文件失败: %w", err)
@@ -65,7 +65,7 @@ func translateExcel(input, output string) error {
 		batch := originals[i:end]
 		log.Printf("翻译第 %d ~ %d 条...", i+1, end)
 
-		part, err := translateBatch(ctx, batch)
+		part, err := translateBatch(ctx, batch, dir)
 		if err != nil {
 			return fmt.Errorf("翻译失败: %w", err)
 		}

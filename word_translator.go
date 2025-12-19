@@ -9,7 +9,7 @@ import (
 )
 
 // translateWord: DOCX-only translation flow (no main here).
-func translateWord(input, output string) error {
+func translateWord(input, output string, dir Direction) error {
 	doc, err := document.Open(input)
 	if err != nil {
 		return fmt.Errorf("open docx: %w", err)
@@ -68,7 +68,7 @@ func translateWord(input, output string) error {
 		batch := originals[i:end]
 		log.Printf("translating %d ~ %d ...", i+1, end)
 
-		part, err := translateBatch(ctx, batch)
+		part, err := translateBatch(ctx, batch, dir)
 		if err != nil {
 			return fmt.Errorf("translate: %w", err)
 		}

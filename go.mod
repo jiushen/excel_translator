@@ -4,6 +4,7 @@ go 1.25.1
 
 require (
 	baliance.com/gooxml v1.0.1
+	gopkg.in/yaml.v3 v3.0.1
 	github.com/xuri/excelize/v2 v2.10.0
 )
 
