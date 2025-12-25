@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 
 	"baliance.com/gooxml/document"
 )
@@ -19,11 +20,9 @@ func translateWord(input, output string, dir Direction) error {
 
 	collectParagraphs := func(paragraphs []document.Paragraph) {
 		for _, p := range paragraphs {
-			for _, r := range p.Runs() {
-				t := r.Text()
-				if t != "" {
-					unique[t] = struct{}{}
-				}
+			txt := paragraphText(p)
+			if txt != "" {
+				unique[txt] = struct{}{}
 			}
 		}
 	}
@@ -79,14 +78,13 @@ func translateWord(input, output string, dir Direction) error {
 
 	applyParagraphs := func(paragraphs []document.Paragraph) error {
 		for _, p := range paragraphs {
-			for _, r := range p.Runs() {
-				t := r.Text()
-				if t == "" {
-					continue
-				}
-				if zh, ok := translations[t]; ok && zh != "" {
-					r.ClearContent()
-					r.AddText(zh)
+			orig := paragraphText(p)
+			if orig == "" {
+				continue
+			}
+			if tr, ok := translations[orig]; ok {
+				if err := applyParagraphTranslation(p, tr); err != nil {
+					return err
 				}
 			}
 		}
@@ -126,5 +124,56 @@ func translateWord(input, output string, dir Direction) error {
 		return fmt.Errorf("save: %w", err)
 	}
 	log.Printf("wrote: %s", output)
+	return nil
+}
+
+// paragraphText concatenates all run texts in a paragraph (without formatting) preserving line breaks.
+func paragraphText(p document.Paragraph) string {
+	var b strings.Builder
+	for i, r := range p.Runs() {
+		b.WriteString(r.Text())
+		if i < len(p.Runs())-1 {
+			// Runs may correspond to line breaks; Text() already includes newlines if present in XML.
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// applyParagraphTranslation splits translated text across existing runs proportionally to original run lengths.
+func applyParagraphTranslation(p document.Paragraph, translated string) error {
+	runs := p.Runs()
+	if len(runs) == 0 {
+		return nil
+	}
+	origLens := make([]int, len(runs))
+	total := 0
+	for i, r := range runs {
+		ln := len([]rune(r.Text()))
+		origLens[i] = ln
+		total += ln
+	}
+	if total == 0 {
+		for i := range origLens {
+			origLens[i] = 1
+		}
+		total = len(origLens)
+	}
+	tr := []rune(translated)
+	offset := 0
+	for i, r := range runs {
+		share := len(tr) * origLens[i] / total
+		if i == len(runs)-1 {
+			share = len(tr) - offset
+			if share < 0 {
+				share = 0
+			}
+		}
+		part := string(tr[offset : offset+share])
+		offset += share
+		r.ClearContent()
+		if part != "" {
+			r.AddText(part)
+		}
+	}
 	return nil
 }

@@ -119,10 +119,12 @@ func translatePPTX(input, output string, dir Direction) error {
 	return nil
 }
 
-// extractTexts collects text content inside <a:t> nodes into the set.
+// extractTexts collects paragraph-level text (concatenated runs in <a:p>) into the set.
 func extractTexts(xmlData []byte, dst map[string]struct{}) {
 	dec := xml.NewDecoder(bytes.NewReader(xmlData))
+	inP := false
 	inText := false
+	var buf strings.Builder
 	for {
 		tok, err := dec.Token()
 		if err != nil {
@@ -133,30 +135,46 @@ func extractTexts(xmlData []byte, dst map[string]struct{}) {
 		}
 		switch t := tok.(type) {
 		case xml.StartElement:
-			if t.Name.Local == "t" {
+			switch t.Name.Local {
+			case "p":
+				inP = true
+				buf.Reset()
+			case "t":
 				inText = true
+			case "br":
+				if inP {
+					buf.WriteString("\n")
+				}
 			}
 		case xml.EndElement:
-			if t.Name.Local == "t" {
+			switch t.Name.Local {
+			case "t":
 				inText = false
+			case "p":
+				inP = false
+				txt := strings.TrimSpace(buf.String())
+				if txt != "" {
+					dst[txt] = struct{}{}
+				}
 			}
 		case xml.CharData:
-			if inText {
-				val := string([]byte(t))
-				if strings.TrimSpace(val) != "" {
-					dst[val] = struct{}{}
-				}
+			if inP && inText {
+				buf.Write([]byte(t))
 			}
 		}
 	}
 }
 
-// rewriteTexts replaces <a:t> char data using translations.
+// rewriteTexts replaces paragraph-level text; first <a:t> in a paragraph is replaced with the translated full paragraph, other runs are emptied.
 func rewriteTexts(xmlData []byte, translations map[string]string) ([]byte, error) {
 	dec := xml.NewDecoder(bytes.NewReader(xmlData))
 	var buf bytes.Buffer
 	enc := xml.NewEncoder(&buf)
+	inP := false
 	inText := false
+	var para strings.Builder
+	var paraTokens []xml.Token
+	var runTexts []string
 
 	for {
 		tok, err := dec.Token()
@@ -168,32 +186,62 @@ func rewriteTexts(xmlData []byte, translations map[string]string) ([]byte, error
 		}
 		switch t := tok.(type) {
 		case xml.StartElement:
-			if t.Name.Local == "t" {
+			if t.Name.Local == "p" {
+				inP = true
+				para.Reset()
+				paraTokens = paraTokens[:0]
+				runTexts = runTexts[:0]
+			}
+			if inP && t.Name.Local == "t" {
 				inText = true
 			}
-			if err := enc.EncodeToken(t); err != nil {
-				return nil, err
+			if inP && t.Name.Local == "br" {
+				para.WriteString("\n")
 			}
-		case xml.EndElement:
-			if t.Name.Local == "t" {
-				inText = false
-			}
-			if err := enc.EncodeToken(t); err != nil {
-				return nil, err
-			}
-		case xml.CharData:
-			if inText {
-				orig := string([]byte(t))
-				if newVal, ok := translations[orig]; ok && newVal != "" {
-					t = xml.CharData([]byte(newVal))
+			if inP {
+				paraTokens = append(paraTokens, t)
+			} else {
+				if err := enc.EncodeToken(t); err != nil {
+					return nil, err
 				}
 			}
-			if err := enc.EncodeToken(t); err != nil {
-				return nil, err
+		case xml.EndElement:
+			if inP {
+				paraTokens = append(paraTokens, t)
+				if t.Name.Local == "t" {
+					inText = false
+				}
+				if t.Name.Local == "p" {
+					inP = false
+					if err := emitParagraph(enc, paraTokens, runTexts, translations, strings.TrimSpace(para.String())); err != nil {
+						return nil, err
+					}
+				}
+			} else {
+				if err := enc.EncodeToken(t); err != nil {
+					return nil, err
+				}
+			}
+		case xml.CharData:
+			if inP {
+				if inText {
+					txt := string([]byte(t))
+					runTexts = append(runTexts, txt)
+					para.WriteString(txt)
+				}
+				paraTokens = append(paraTokens, t)
+			} else {
+				if err := enc.EncodeToken(t); err != nil {
+					return nil, err
+				}
 			}
 		default:
-			if err := enc.EncodeToken(t); err != nil {
-				return nil, err
+			if inP {
+				paraTokens = append(paraTokens, t)
+			} else {
+				if err := enc.EncodeToken(t); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
@@ -201,6 +249,80 @@ func rewriteTexts(xmlData []byte, translations map[string]string) ([]byte, error
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+func emitParagraph(enc *xml.Encoder, tokens []xml.Token, runTexts []string, translations map[string]string, key string) error {
+	runOutputs := splitTranslatedRuns(runTexts, translations[key])
+	runIdx := 0
+	inText := false
+	for _, tok := range tokens {
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if t.Name.Local == "t" {
+				inText = true
+			}
+			if err := enc.EncodeToken(t); err != nil {
+				return err
+			}
+		case xml.EndElement:
+			if t.Name.Local == "t" {
+				inText = false
+			}
+			if err := enc.EncodeToken(t); err != nil {
+				return err
+			}
+		case xml.CharData:
+			if inText && runIdx < len(runOutputs) {
+				if err := enc.EncodeToken(xml.CharData(runOutputs[runIdx])); err != nil {
+					return err
+				}
+				runIdx++
+			} else {
+				if err := enc.EncodeToken(t); err != nil {
+					return err
+				}
+			}
+		default:
+			if err := enc.EncodeToken(tok); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func splitTranslatedRuns(origRuns []string, translated string) [][]byte {
+	if len(origRuns) == 0 {
+		return nil
+	}
+	tr := []rune(translated)
+	total := 0
+	runLens := make([]int, len(origRuns))
+	for i, s := range origRuns {
+		runLens[i] = len([]rune(s))
+		total += runLens[i]
+	}
+	if total == 0 {
+		for i := range runLens {
+			runLens[i] = 1
+		}
+		total = len(origRuns)
+	}
+
+	res := make([][]byte, len(origRuns))
+	offset := 0
+	for i, ln := range runLens {
+		share := len(tr) * ln / total
+		if i == len(runLens)-1 {
+			share = len(tr) - offset
+			if share < 0 {
+				share = 0
+			}
+		}
+		res[i] = []byte(string(tr[offset : offset+share]))
+		offset += share
+	}
+	return res
 }
 
 // copyZip writes all parts to a new zip file preserving names and raw data.
