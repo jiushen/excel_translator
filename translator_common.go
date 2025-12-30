@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -42,10 +44,15 @@ type Config struct {
 
 	PromptZH2JA string `yaml:"prompt_zh2ja"`
 	PromptJA2ZH string `yaml:"prompt_ja2zh"`
+
+	LogDir   string `yaml:"log_dir"`
+	LogFile  string `yaml:"log_file"`
+	LogLevel string `yaml:"log_level"` // debug|info|warn|error
 }
 
 // populated from config file (and CLI flags)
 var config Config
+var logLevel level
 
 func loadConfig(path string) error {
 	b, err := os.ReadFile(path)
@@ -60,6 +67,7 @@ func loadConfig(path string) error {
 	if config.BatchSize <= 0 {
 		config.BatchSize = 50
 	}
+	logLevel = parseLevel(config.LogLevel)
 	return nil
 }
 
@@ -80,6 +88,48 @@ func ensureProviderConfig() error {
 		return fmt.Errorf("prompt_zh2ja/prompt_ja2zh must be set in config.yaml")
 	}
 	return nil
+}
+
+type level int
+
+const (
+	levelDebug level = iota
+	levelInfo
+	levelWarn
+	levelError
+)
+
+func parseLevel(s string) level {
+	switch strings.ToLower(s) {
+	case "debug":
+		return levelDebug
+	case "info":
+		return levelInfo
+	case "warn", "warning":
+		return levelWarn
+	case "error":
+		return levelError
+	default:
+		return levelInfo
+	}
+}
+
+func logf(lvl level, format string, args ...any) {
+	if lvl < logLevel {
+		return
+	}
+	prefix := ""
+	switch lvl {
+	case levelDebug:
+		prefix = "[DEBUG] "
+	case levelWarn:
+		prefix = "[WARN] "
+	case levelError:
+		prefix = "[ERROR] "
+	default:
+		prefix = "[INFO] "
+	}
+	log.Printf(prefix+format, args...)
 }
 
 func translateBatch(ctx context.Context, src []string, dir Direction) (map[string]string, error) {
@@ -131,9 +181,8 @@ func callChatAPI(ctx context.Context, texts []string, dir Direction, baseURL, ap
 
 	bodyBytes, _ := json.Marshal(reqBody)
 
-	if debug {
-		fmt.Printf("[DEBUG] request url=%s model=%s dir=%s batch=%d body=%s\n", baseURL, model, dir, len(texts), string(bodyBytes))
-	}
+	logf(levelDebug, "LLM request url=%s model=%s dir=%s batch=%d", baseURL, model, dir, len(texts))
+	logf(levelDebug, "LLM request body=%s", string(bodyBytes))
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL, bytes.NewReader(bodyBytes))
 	if err != nil {
@@ -151,9 +200,8 @@ func callChatAPI(ctx context.Context, texts []string, dir Direction, baseURL, ap
 
 	respBytes, _ := io.ReadAll(resp.Body)
 
-	if debug {
-		fmt.Printf("[DEBUG] response status=%s body=%s\n", resp.Status, string(respBytes))
-	}
+	logf(levelDebug, "LLM response status=%s", resp.Status)
+	logf(levelDebug, "LLM response body=%s", string(respBytes))
 
 	if resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("API error: %s\n%s", resp.Status, string(respBytes))
@@ -161,7 +209,7 @@ func callChatAPI(ctx context.Context, texts []string, dir Direction, baseURL, ap
 
 	var cr chatResponse
 	if err := json.Unmarshal(respBytes, &cr); err != nil {
-		return nil, fmt.Errorf("decode: %w", err)
+		return nil, fmt.Errorf("decode: %w\nraw=%s", err, string(respBytes))
 	}
 	if len(cr.Choices) == 0 {
 		return nil, fmt.Errorf("no choices in response")
@@ -196,4 +244,27 @@ type chatResponse struct {
 			Content string `json:"content"`
 		} `json:"message"`
 	} `json:"choices"`
+}
+
+func setupLogger() error {
+	var outputs []io.Writer
+	outputs = append(outputs, os.Stdout)
+
+	if config.LogFile != "" {
+		dir := config.LogDir
+		if dir == "" {
+			dir = "."
+		}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+		f, err := os.OpenFile(dir+string(os.PathSeparator)+config.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return err
+		}
+		outputs = append(outputs, f)
+	}
+
+	log.SetOutput(io.MultiWriter(outputs...))
+	return nil
 }

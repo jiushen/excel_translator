@@ -20,6 +20,9 @@ func main() {
 	if err := loadConfig(*cfgPath); err != nil {
 		log.Fatalf("load config failed: %v", err)
 	}
+	if err := setupLogger(); err != nil {
+		log.Fatalf("setup logger failed: %v", err)
+	}
 	if providerFlag != nil && *providerFlag != "" {
 		config.Provider = Provider(*providerFlag)
 	}
