@@ -42,6 +42,8 @@ type Config struct {
 
 	BatchSize int `yaml:"batch_size"`
 
+	TimeoutSeconds int `yaml:"timeout_seconds"`
+
 	PromptZH2JA string `yaml:"prompt_zh2ja"`
 	PromptJA2ZH string `yaml:"prompt_ja2zh"`
 
@@ -66,6 +68,9 @@ func loadConfig(path string) error {
 	config = cfg
 	if config.BatchSize <= 0 {
 		config.BatchSize = 50
+	}
+	if config.TimeoutSeconds <= 0 {
+		config.TimeoutSeconds = 600
 	}
 	logLevel = parseLevel(config.LogLevel)
 	return nil
@@ -191,7 +196,9 @@ func callChatAPI(ctx context.Context, texts []string, dir Direction, baseURL, ap
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 60 * time.Second}
+	timeout := time.Duration(config.TimeoutSeconds) * time.Second
+	client := &http.Client{Timeout: timeout}
+	logf(levelDebug, "HTTP timeout set to %v for provider %s (batch size: %d)", timeout, config.Provider, len(texts))
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err

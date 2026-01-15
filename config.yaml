@@ -13,6 +13,9 @@ deepseek_url: "https://api.deepseek.com/v1/chat/completions"
 # batch size for translation requests
 batch_size: 50
 
+# timeout for API requests (in seconds)
+timeout_seconds: 600
+
 log_dir: "logs"
 log_file: "translate.log"
 log_level: "debug"

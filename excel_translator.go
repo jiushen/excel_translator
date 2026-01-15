@@ -224,6 +224,7 @@ func extractSharedStrings(data []byte, unique map[string]struct{}) error {
 	dec := xml.NewDecoder(bytes.NewReader(data))
 	inSI := false
 	inT := false
+	inRPh := false
 	var text strings.Builder
 	for {
 		tok, err := dec.Token()
@@ -239,18 +240,25 @@ func extractSharedStrings(data []byte, unique map[string]struct{}) error {
 			case "si":
 				inSI = true
 				inT = false
+				inRPh = false
 				text.Reset()
+			case "rPh":
+				// 进入注音标签，忽略其中的文本
+				inRPh = true
 			case "t":
-				if inSI {
+				// 只处理不在rPh中的t标签
+				if inSI && !inRPh {
 					inT = true
 				}
 			}
 		case xml.EndElement:
 			switch t.Name.Local {
 			case "t":
-				if inSI {
+				if inSI && !inRPh {
 					inT = false
 				}
+			case "rPh":
+				inRPh = false
 			case "si":
 				if inSI {
 					s := text.String()
@@ -261,7 +269,8 @@ func extractSharedStrings(data []byte, unique map[string]struct{}) error {
 				inSI = false
 			}
 		case xml.CharData:
-			if inSI && inT {
+			// 收集所有不在rPh中的t标签内的文本
+			if inSI && inT && !inRPh {
 				text.Write([]byte(t))
 			}
 		}
@@ -270,21 +279,118 @@ func extractSharedStrings(data []byte, unique map[string]struct{}) error {
 
 func rewriteSharedStrings(data []byte, translations map[string]string) ([]byte, error) {
 	siRe := regexp.MustCompile(`(?s)<si\b[^>]*>.*?</si>`)
-	tRe := regexp.MustCompile(`(?s)<t\b[^>]*>(.*?)</t>`)
 	s := string(data)
+	
 	out := siRe.ReplaceAllStringFunc(s, func(block string) string {
-		runs, ranges := extractTagRuns(block, tRe)
+		// 使用XML解析器提取文本
+		dec := xml.NewDecoder(strings.NewReader(block))
+		inSI := false
+		inT := false
+		inRPh := false
+		var runs []string
+		var textBuilder strings.Builder
+		
+		for {
+			tok, err := dec.Token()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return block
+			}
+			
+			switch t := tok.(type) {
+			case xml.StartElement:
+				switch t.Name.Local {
+				case "si":
+					inSI = true
+				case "rPh":
+					inRPh = true
+				case "t":
+					if inSI && !inRPh {
+						inT = true
+						textBuilder.Reset()
+					}
+				}
+			case xml.EndElement:
+				switch t.Name.Local {
+				case "t":
+					if inSI && !inRPh && inT {
+						runs = append(runs, textBuilder.String())
+						inT = false
+					}
+				case "rPh":
+					inRPh = false
+				case "si":
+					inSI = false
+				}
+			case xml.CharData:
+				if inSI && inT && !inRPh {
+					textBuilder.Write([]byte(t))
+				}
+			}
+		}
+		
 		if len(runs) == 0 {
 			return block
 		}
+		
+		// 合并原文
 		orig := strings.Join(runs, "")
 		v, ok := translations[orig]
 		if !ok || v == "" {
 			return block
 		}
-		runOutputs := splitTranslatedRunsExcel(runs, v)
-		return replaceRanges(block, ranges, runOutputs)
+		
+		// 按比例分配译文
+		translatedRuns := splitTranslatedRunsExcel(runs, v)
+		
+		// 使用正则表达式替换<t>标签内容（跳过<rPh>中的<t>）
+		result := block
+		idx := 0
+		pos := 0
+		
+		for {
+			// 查找下一个<t>标签
+			tStart := strings.Index(result[pos:], "<t")
+			if tStart == -1 {
+				break
+			}
+			tStart += pos
+			
+			// 检查这个<t>是否在<rPh>标签内
+			rPhStart := strings.LastIndex(result[:tStart], "<rPh")
+			rPhEnd := strings.LastIndex(result[:tStart], "</rPh>")
+			inRPh := rPhStart != -1 && (rPhEnd == -1 || rPhStart > rPhEnd)
+			
+			// 找到<t>标签的结束位置
+			tTagEnd := strings.Index(result[tStart:], ">")
+			if tTagEnd == -1 {
+				break
+			}
+			tTagEnd += tStart + 1
+			
+			tEnd := strings.Index(result[tTagEnd:], "</t>")
+			if tEnd == -1 {
+				break
+			}
+			tEnd += tTagEnd
+			
+			if !inRPh && idx < len(translatedRuns) {
+				// 这是主文本的<t>标签，替换内容
+				newText := escapeXMLText(string(translatedRuns[idx]))
+				result = result[:tTagEnd] + newText + result[tEnd:]
+				pos = tTagEnd + len(newText)
+				idx++
+			} else {
+				// 这是<rPh>中的<t>标签，跳过
+				pos = tEnd + 4
+			}
+		}
+		
+		return result
 	})
+	
 	return []byte(out), nil
 }
 
@@ -365,22 +471,59 @@ func rewriteInlineStrings(data []byte, translations map[string]string) ([]byte, 
 	cellRe := regexp.MustCompile(`(?s)<c\b[^>]*\bt="inlineStr"[^>]*>.*?</c>`)
 	tRe := regexp.MustCompile(`(?s)<t\b[^>]*>(.*?)</t>`)
 	s := string(data)
+	
 	out := cellRe.ReplaceAllStringFunc(s, func(cell string) string {
 		if strings.Contains(cell, "<f") {
 			return cell
 		}
-		runs, ranges := extractTagRuns(cell, tRe)
-		if len(runs) == 0 {
+		
+		// 提取所有<t>标签的文本内容
+		matches := tRe.FindAllStringSubmatchIndex(cell, -1)
+		if len(matches) == 0 {
 			return cell
 		}
+		
+		// 收集原文文本段
+		runs := make([]string, 0, len(matches))
+		for _, m := range matches {
+			if len(m) >= 4 {
+				rawText := cell[m[2]:m[3]]
+				runs = append(runs, html.UnescapeString(rawText))
+			}
+		}
+		
+		// 合并原文
 		orig := strings.Join(runs, "")
 		v, ok := translations[orig]
 		if !ok || v == "" {
 			return cell
 		}
-		runOutputs := splitTranslatedRunsExcel(runs, v)
-		return replaceRanges(cell, ranges, runOutputs)
+		
+		// 按比例分配译文
+		translatedRuns := splitTranslatedRunsExcel(runs, v)
+		
+		// 替换每个<t>标签的内容
+		idx := 0
+		result := tRe.ReplaceAllStringFunc(cell, func(tag string) string {
+			if idx >= len(translatedRuns) {
+				return tag
+			}
+			
+			start := strings.Index(tag, ">")
+			end := strings.LastIndex(tag, "</t>")
+			if start == -1 || end == -1 || start+1 > end {
+				idx++
+				return tag
+			}
+			
+			newText := escapeXMLText(string(translatedRuns[idx]))
+			idx++
+			return tag[:start+1] + newText + tag[end:]
+		})
+		
+		return result
 	})
+	
 	return []byte(out), nil
 }
 
@@ -476,29 +619,49 @@ func replaceVMLTexts(data []byte, translations map[string]string) ([]byte, bool,
 	boxRe := regexp.MustCompile(`(?s)<v:textbox\b[^>]*>.*?</v:textbox>`)
 	s := string(data)
 	changed := false
+	
 	out := boxRe.ReplaceAllStringFunc(s, func(box string) string {
 		start := strings.Index(box, ">")
 		end := strings.LastIndex(box, "</v:textbox>")
 		if start == -1 || end == -1 || start+1 > end {
 			return box
 		}
+		
 		inner := box[start+1 : end]
 		runs, ranges := extractTextRuns(inner)
 		if len(runs) == 0 {
 			return box
 		}
+		
 		orig := strings.Join(runs, "")
 		v, ok := translations[orig]
 		if !ok || v == "" {
 			return box
 		}
-		runOutputs := splitTranslatedRunsExcel(runs, v)
-		newInner := replaceRanges(inner, ranges, runOutputs)
+		
+		// 按比例分配译文
+		translatedRuns := splitTranslatedRunsExcel(runs, v)
+		
+		// 替换文本段
+		var buf strings.Builder
+		last := 0
+		for i, r := range ranges {
+			if len(r) < 2 || i >= len(translatedRuns) {
+				continue
+			}
+			buf.WriteString(inner[last:r[0]])
+			buf.WriteString(escapeXMLText(string(translatedRuns[i])))
+			last = r[1]
+		}
+		buf.WriteString(inner[last:])
+		newInner := buf.String()
+		
 		if newInner != inner {
 			changed = true
 		}
 		return box[:start+1] + newInner + box[end:]
 	})
+	
 	return []byte(out), changed, nil
 }
 
@@ -561,33 +724,69 @@ func splitTranslatedRunsExcel(origRuns []string, translated string) [][]byte {
 	if len(origRuns) == 0 {
 		return nil
 	}
-	tr := []rune(translated)
+	
+	// Calculate total original length in runes
 	total := 0
 	runLens := make([]int, len(origRuns))
 	for i, s := range origRuns {
 		runLens[i] = len([]rune(s))
 		total += runLens[i]
 	}
+	
+	// If all runs are empty, distribute evenly
 	if total == 0 {
-		for i := range runLens {
-			runLens[i] = 1
+		res := make([][]byte, len(origRuns))
+		tr := []rune(translated)
+		chunkSize := len(tr) / len(origRuns)
+		remainder := len(tr) % len(origRuns)
+		offset := 0
+		for i := range res {
+			size := chunkSize
+			if i < remainder {
+				size++
+			}
+			if offset+size > len(tr) {
+				size = len(tr) - offset
+			}
+			if size > 0 {
+				res[i] = []byte(string(tr[offset : offset+size]))
+				offset += size
+			} else {
+				res[i] = []byte("")
+			}
 		}
-		total = len(origRuns)
+		return res
 	}
-
+	
+	// Distribute translated text proportionally based on original run lengths
 	res := make([][]byte, len(origRuns))
+	tr := []rune(translated)
 	offset := 0
+	
 	for i, ln := range runLens {
+		// Calculate this run's share proportionally
 		share := len(tr) * ln / total
+		
+		// Last run gets all remaining characters
 		if i == len(runLens)-1 {
 			share = len(tr) - offset
 			if share < 0 {
 				share = 0
 			}
 		}
-		res[i] = []byte(string(tr[offset : offset+share]))
-		offset += share
+		
+		if share > 0 && offset < len(tr) {
+			end := offset + share
+			if end > len(tr) {
+				end = len(tr)
+			}
+			res[i] = []byte(string(tr[offset:end]))
+			offset = end
+		} else {
+			res[i] = []byte("")
+		}
 	}
+	
 	return res
 }
 
