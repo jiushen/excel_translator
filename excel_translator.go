@@ -388,6 +388,10 @@ func rewriteSharedStrings(data []byte, translations map[string]string) ([]byte, 
 			}
 		}
 		
+		// 删除所有<rPh>标签（因为中文译文不需要日文注音）
+		rPhRe := regexp.MustCompile(`(?s)<rPh\b[^>]*>.*?</rPh>`)
+		result = rPhRe.ReplaceAllString(result, "")
+		
 		return result
 	})
 	
@@ -725,16 +729,41 @@ func splitTranslatedRunsExcel(origRuns []string, translated string) [][]byte {
 		return nil
 	}
 	
-	// Calculate total original length in runes
-	total := 0
-	runLens := make([]int, len(origRuns))
-	for i, s := range origRuns {
-		runLens[i] = len([]rune(s))
-		total += runLens[i]
+	// Extract leading/trailing whitespace from each run
+	type runInfo struct {
+		leading  string
+		core     string
+		trailing string
+		coreLen  int
 	}
 	
-	// If all runs are empty, distribute evenly
-	if total == 0 {
+	runs := make([]runInfo, len(origRuns))
+	totalCore := 0
+	
+	for i, s := range origRuns {
+		// Find leading whitespace
+		leadEnd := 0
+		for leadEnd < len(s) && (s[leadEnd] == ' ' || s[leadEnd] == '\t' || s[leadEnd] == '\n' || s[leadEnd] == '\r') {
+			leadEnd++
+		}
+		
+		// Find trailing whitespace
+		trailStart := len(s)
+		for trailStart > leadEnd && (s[trailStart-1] == ' ' || s[trailStart-1] == '\t' || s[trailStart-1] == '\n' || s[trailStart-1] == '\r') {
+			trailStart--
+		}
+		
+		runs[i] = runInfo{
+			leading:  s[:leadEnd],
+			core:     s[leadEnd:trailStart],
+			trailing: s[trailStart:],
+			coreLen:  len([]rune(s[leadEnd:trailStart])),
+		}
+		totalCore += runs[i].coreLen
+	}
+	
+	// If all cores are empty, distribute evenly
+	if totalCore == 0 {
 		res := make([][]byte, len(origRuns))
 		tr := []rune(translated)
 		chunkSize := len(tr) / len(origRuns)
@@ -748,43 +777,49 @@ func splitTranslatedRunsExcel(origRuns []string, translated string) [][]byte {
 			if offset+size > len(tr) {
 				size = len(tr) - offset
 			}
+			var result strings.Builder
+			result.WriteString(runs[i].leading)
 			if size > 0 {
-				res[i] = []byte(string(tr[offset : offset+size]))
+				result.WriteString(string(tr[offset : offset+size]))
 				offset += size
-			} else {
-				res[i] = []byte("")
 			}
+			result.WriteString(runs[i].trailing)
+			res[i] = []byte(result.String())
 		}
 		return res
 	}
 	
-	// Distribute translated text proportionally based on original run lengths
+	// Distribute translated text proportionally based on core lengths
 	res := make([][]byte, len(origRuns))
 	tr := []rune(translated)
 	offset := 0
 	
-	for i, ln := range runLens {
+	for i, run := range runs {
 		// Calculate this run's share proportionally
-		share := len(tr) * ln / total
+		share := len(tr) * run.coreLen / totalCore
 		
 		// Last run gets all remaining characters
-		if i == len(runLens)-1 {
+		if i == len(runs)-1 {
 			share = len(tr) - offset
 			if share < 0 {
 				share = 0
 			}
 		}
 		
+		var result strings.Builder
+		result.WriteString(run.leading)
+		
 		if share > 0 && offset < len(tr) {
 			end := offset + share
 			if end > len(tr) {
 				end = len(tr)
 			}
-			res[i] = []byte(string(tr[offset:end]))
+			result.WriteString(string(tr[offset:end]))
 			offset = end
-		} else {
-			res[i] = []byte("")
 		}
+		
+		result.WriteString(run.trailing)
+		res[i] = []byte(result.String())
 	}
 	
 	return res
