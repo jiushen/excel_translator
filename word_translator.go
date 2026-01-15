@@ -1,59 +1,80 @@
 package main
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
+	"encoding/xml"
 	"fmt"
+	"html"
+	"io"
 	"log"
+	"os"
+	"path"
+	"regexp"
+	"sort"
 	"strings"
-
-	"baliance.com/gooxml/document"
 )
+
+type wordPart struct {
+	name   string
+	data   []byte
+	method uint16
+}
 
 // translateWord: DOCX-only translation flow (no main here).
 func translateWord(input, output string, dir Direction) error {
-	doc, err := document.Open(input)
+	inFile, err := os.Open(input)
 	if err != nil {
 		return fmt.Errorf("open docx: %w", err)
 	}
+	defer inFile.Close()
 
+	stat, err := inFile.Stat()
+	if err != nil {
+		return fmt.Errorf("stat docx: %w", err)
+	}
+
+	zr, err := zip.NewReader(inFile, stat.Size())
+	if err != nil {
+		return fmt.Errorf("open zip: %w", err)
+	}
+
+	parts := make([]wordPart, 0, len(zr.File))
 	unique := make(map[string]struct{})
 
-	collectParagraphs := func(paragraphs []document.Paragraph) {
-		for _, p := range paragraphs {
-			txt := paragraphText(p)
-			if txt != "" {
-				unique[txt] = struct{}{}
-			}
+	for _, f := range zr.File {
+		rc, err := f.Open()
+		if err != nil {
+			return fmt.Errorf("read %s: %w", f.Name, err)
 		}
-	}
-	collectTables := func(tables []document.Table) {
-		for _, tbl := range tables {
-			for _, row := range tbl.Rows() {
-				for _, cell := range row.Cells() {
-					collectParagraphs(cell.Paragraphs())
-				}
-			}
+		buf, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			return fmt.Errorf("read %s: %w", f.Name, err)
 		}
-	}
 
-	collectParagraphs(doc.Paragraphs())
-	collectTables(doc.Tables())
-	for _, h := range doc.Headers() {
-		collectParagraphs(h.Paragraphs())
-	}
-	for _, f := range doc.Footers() {
-		collectParagraphs(f.Paragraphs())
+		if isWordTargetXML(f.Name) {
+			extractWordParagraphTexts(buf, unique)
+		}
+
+		parts = append(parts, wordPart{
+			name:   f.Name,
+			data:   buf,
+			method: f.Method,
+		})
 	}
 
 	if len(unique) == 0 {
 		log.Println("nothing to translate")
-		return nil
+		return copyWordZip(parts, output)
 	}
 
 	originals := make([]string, 0, len(unique))
 	for s := range unique {
 		originals = append(originals, s)
 	}
+	sort.Strings(originals)
 	log.Printf("unique texts: %d\n", len(originals))
 
 	translations := make(map[string]string)
@@ -76,104 +97,171 @@ func translateWord(input, output string, dir Direction) error {
 		}
 	}
 
-	applyParagraphs := func(paragraphs []document.Paragraph) error {
-		for _, p := range paragraphs {
-			orig := paragraphText(p)
-			if orig == "" {
-				continue
-			}
-			if tr, ok := translations[orig]; ok {
-				if err := applyParagraphTranslation(p, tr); err != nil {
-					return err
-				}
-			}
+	for i, p := range parts {
+		if !isWordTargetXML(p.name) {
+			continue
 		}
-		return nil
-	}
-	applyTables := func(tables []document.Table) error {
-		for _, tbl := range tables {
-			for _, row := range tbl.Rows() {
-				for _, cell := range row.Cells() {
-					if err := applyParagraphs(cell.Paragraphs()); err != nil {
-						return err
-					}
-				}
-			}
-		}
-		return nil
+		newXML := rewriteWordParagraphTexts(p.data, translations)
+		parts[i].data = newXML
 	}
 
-	if err := applyParagraphs(doc.Paragraphs()); err != nil {
+	if err := copyWordZip(parts, output); err != nil {
 		return err
-	}
-	if err := applyTables(doc.Tables()); err != nil {
-		return err
-	}
-	for _, h := range doc.Headers() {
-		if err := applyParagraphs(h.Paragraphs()); err != nil {
-			return err
-		}
-	}
-	for _, f := range doc.Footers() {
-		if err := applyParagraphs(f.Paragraphs()); err != nil {
-			return err
-		}
-	}
-
-	if err := doc.SaveToFile(output); err != nil {
-		return fmt.Errorf("save: %w", err)
 	}
 	log.Printf("wrote: %s", output)
 	return nil
 }
 
-// paragraphText concatenates all run texts in a paragraph (without formatting) preserving line breaks.
-func paragraphText(p document.Paragraph) string {
-	var b strings.Builder
-	for i, r := range p.Runs() {
-		b.WriteString(r.Text())
-		if i < len(p.Runs())-1 {
-			// Runs may correspond to line breaks; Text() already includes newlines if present in XML.
-		}
+func isWordTargetXML(name string) bool {
+	if name == "word/document.xml" {
+		return true
 	}
-	return strings.TrimSpace(b.String())
+	if strings.HasPrefix(name, "word/header") && strings.HasSuffix(name, ".xml") {
+		return true
+	}
+	if strings.HasPrefix(name, "word/footer") && strings.HasSuffix(name, ".xml") {
+		return true
+	}
+	return false
 }
 
-// applyParagraphTranslation splits translated text across existing runs proportionally to original run lengths.
-func applyParagraphTranslation(p document.Paragraph, translated string) error {
-	runs := p.Runs()
-	if len(runs) == 0 {
+func extractWordParagraphTexts(data []byte, unique map[string]struct{}) {
+	pRe := regexp.MustCompile(`(?s)<w:p\b[^>]*>.*?</w:p>`)
+	tRe := regexp.MustCompile(`(?s)<w:t\b[^>]*>(.*?)</w:t>`)
+	s := string(data)
+	pRe.ReplaceAllStringFunc(s, func(block string) string {
+		runs, _ := extractWordTagRuns(block, tRe)
+		if len(runs) == 0 {
+			return block
+		}
+		txt := strings.TrimSpace(strings.Join(runs, ""))
+		if txt != "" {
+			unique[txt] = struct{}{}
+		}
+		return block
+	})
+}
+
+func rewriteWordParagraphTexts(data []byte, translations map[string]string) []byte {
+	pRe := regexp.MustCompile(`(?s)<w:p\b[^>]*>.*?</w:p>`)
+	tRe := regexp.MustCompile(`(?s)<w:t\b[^>]*>(.*?)</w:t>`)
+	s := string(data)
+	out := pRe.ReplaceAllStringFunc(s, func(block string) string {
+		runs, ranges := extractWordTagRuns(block, tRe)
+		if len(runs) == 0 {
+			return block
+		}
+		orig := strings.TrimSpace(strings.Join(runs, ""))
+		v, ok := translations[orig]
+		if !ok || v == "" {
+			return block
+		}
+		runOutputs := splitTranslatedRunsWord(runs, v)
+		return replaceWordRanges(block, ranges, runOutputs)
+	})
+	return []byte(out)
+}
+
+func extractWordTagRuns(block string, tRe *regexp.Regexp) ([]string, [][]int) {
+	matches := tRe.FindAllStringSubmatchIndex(block, -1)
+	runs := make([]string, 0, len(matches))
+	ranges := make([][]int, 0, len(matches))
+	for _, m := range matches {
+		if len(m) < 4 {
+			continue
+		}
+		raw := block[m[2]:m[3]]
+		runs = append(runs, html.UnescapeString(raw))
+		ranges = append(ranges, []int{m[2], m[3]})
+	}
+	return runs, ranges
+}
+
+func replaceWordRanges(block string, ranges [][]int, runs [][]byte) string {
+	var buf strings.Builder
+	last := 0
+	for i, r := range ranges {
+		if len(r) < 2 {
+			continue
+		}
+		buf.WriteString(block[last:r[0]])
+		if i < len(runs) {
+			buf.WriteString(escapeWordXMLText(string(runs[i])))
+		}
+		last = r[1]
+	}
+	buf.WriteString(block[last:])
+	return buf.String()
+}
+
+func escapeWordXMLText(s string) string {
+	var buf bytes.Buffer
+	_ = xml.EscapeText(&buf, []byte(s))
+	return buf.String()
+}
+
+func splitTranslatedRunsWord(origRuns []string, translated string) [][]byte {
+	if len(origRuns) == 0 {
 		return nil
 	}
-	origLens := make([]int, len(runs))
+	tr := []rune(translated)
 	total := 0
-	for i, r := range runs {
-		ln := len([]rune(r.Text()))
-		origLens[i] = ln
-		total += ln
+	runLens := make([]int, len(origRuns))
+	for i, s := range origRuns {
+		runLens[i] = len([]rune(s))
+		total += runLens[i]
 	}
 	if total == 0 {
-		for i := range origLens {
-			origLens[i] = 1
+		for i := range runLens {
+			runLens[i] = 1
 		}
-		total = len(origLens)
+		total = len(origRuns)
 	}
-	tr := []rune(translated)
+
+	res := make([][]byte, len(origRuns))
 	offset := 0
-	for i, r := range runs {
-		share := len(tr) * origLens[i] / total
-		if i == len(runs)-1 {
+	for i, ln := range runLens {
+		share := len(tr) * ln / total
+		if i == len(runLens)-1 {
 			share = len(tr) - offset
 			if share < 0 {
 				share = 0
 			}
 		}
-		part := string(tr[offset : offset+share])
+		res[i] = []byte(string(tr[offset : offset+share]))
 		offset += share
-		r.ClearContent()
-		if part != "" {
-			r.AddText(part)
+	}
+	return res
+}
+
+func copyWordZip(parts []wordPart, output string) error {
+	outFile, err := os.Create(output)
+	if err != nil {
+		return fmt.Errorf("create output: %w", err)
+	}
+	defer outFile.Close()
+
+	zw := zip.NewWriter(outFile)
+	for _, p := range parts {
+		h := &zip.FileHeader{
+			Name:   p.name,
+			Method: p.method,
 		}
+		if strings.HasSuffix(p.name, "/") || path.Base(p.name) == "" {
+			h.Method = zip.Store
+		}
+		w, err := zw.CreateHeader(h)
+		if err != nil {
+			zw.Close()
+			return fmt.Errorf("write %s header: %w", p.name, err)
+		}
+		if _, err := w.Write(p.data); err != nil {
+			zw.Close()
+			return fmt.Errorf("write %s data: %w", p.name, err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		return fmt.Errorf("finalize zip: %w", err)
 	}
 	return nil
 }
