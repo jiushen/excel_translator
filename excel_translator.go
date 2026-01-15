@@ -1,160 +1,387 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/xml"
 	"fmt"
+	"html"
 	"io"
 	"log"
+	"os"
+	"path"
+	"regexp"
+	"sort"
 	"strings"
-
-	"github.com/xuri/excelize/v2"
 )
-
-// translateExcel: Excel-only translation flow (no main here).
-func translateExcel(input, output string, dir Direction) error {
-	f, err := excelize.OpenFile(input)
-	if err != nil {
-		return fmt.Errorf("打开文件失败: %w", err)
-	}
-	defer f.Close()
-
-	uniqueTexts := make(map[string]struct{})
-
-	for _, sheet := range f.GetSheetList() {
-		if sheet != "" {
-			uniqueTexts[sheet] = struct{}{}
-		}
-	}
-
-	for _, sheet := range f.GetSheetList() {
-		rows, err := f.GetRows(sheet)
-		if err != nil {
-			return fmt.Errorf("读取 sheet %s 失败: %w", sheet, err)
-		}
-		for rIdx, row := range rows {
-			for cIdx := range row {
-				cellRef, _ := excelize.CoordinatesToCellName(cIdx+1, rIdx+1)
-
-				if formula, _ := f.GetCellFormula(sheet, cellRef); formula != "" {
-					continue
-				}
-
-				val, err := f.GetCellValue(sheet, cellRef)
-				if err != nil {
-					return fmt.Errorf("读取单元格 %s!%s 失败: %w", sheet, cellRef, err)
-				}
-				if val == "" {
-					continue
-				}
-				uniqueTexts[val] = struct{}{}
-			}
-		}
-	}
-
-	if err := collectDrawingTexts(f, uniqueTexts); err != nil {
-		logf(levelWarn, "read drawing text: %v", err)
-	}
-
-	if len(uniqueTexts) == 0 {
-		log.Println("没有发现需要翻译的文本。")
-		return nil
-	}
-
-	originals := make([]string, 0, len(uniqueTexts))
-	for s := range uniqueTexts {
-		originals = append(originals, s)
-	}
-	log.Printf("需要翻译的唯一文本数量: %d\n", len(originals))
-
-	translations := make(map[string]string)
-	ctx := context.Background()
-
-	for i := 0; i < len(originals); i += config.BatchSize {
-		end := i + config.BatchSize
-		if end > len(originals) {
-			end = len(originals)
-		}
-		batch := originals[i:end]
-		log.Printf("翻译第 %d ~ %d 条...", i+1, end)
-
-		part, err := translateBatch(ctx, batch, dir)
-		if err != nil {
-			return fmt.Errorf("翻译失败: %w", err)
-		}
-		for k, v := range part {
-			translations[k] = v
-		}
-	}
-
-	for _, sheet := range f.GetSheetList() {
-		rows, err := f.GetRows(sheet)
-		if err != nil {
-			return fmt.Errorf("读取 sheet %s 失败: %w", sheet, err)
-		}
-		for rIdx, row := range rows {
-			for cIdx := range row {
-				cellRef, _ := excelize.CoordinatesToCellName(cIdx+1, rIdx+1)
-
-				if formula, _ := f.GetCellFormula(sheet, cellRef); formula != "" {
-					continue
-				}
-
-				val, err := f.GetCellValue(sheet, cellRef)
-				if err != nil || val == "" {
-					continue
-				}
-				if zh, ok := translations[val]; ok && zh != "" {
-					if err := f.SetCellStr(sheet, cellRef, zh); err != nil {
-						return fmt.Errorf("写入单元格 %s!%s 失败: %w", sheet, cellRef, err)
-					}
-				}
-			}
-		}
-	}
-
-	if err := applyDrawingTranslations(f, translations); err != nil {
-		logf(levelWarn, "write drawing text: %v", err)
-	}
-	applySheetNameTranslations(f, translations)
-
-	if err := f.SaveAs(output); err != nil {
-		return fmt.Errorf("保存文件失败: %w", err)
-	}
-	log.Printf("已输出到: %s", output)
-	return nil
-}
 
 const (
 	drawingMLNS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 	vmlNS       = "urn:schemas-microsoft-com:vml"
 )
 
-func collectDrawingTexts(f *excelize.File, unique map[string]struct{}) error {
-	var firstErr error
-	f.Pkg.Range(func(k, v interface{}) bool {
-		name, ok := k.(string)
-		if !ok {
-			return true
+type excelPart struct {
+	name   string
+	data   []byte
+	method uint16
+}
+
+// translateExcel: Excel-only translation flow (no main here).
+// This implementation rewrites only text-bearing XML parts and copies all
+// other ZIP entries byte-for-byte to avoid re-generating the workbook.
+func translateExcel(input, output string, dir Direction) error {
+	inFile, err := os.Open(input)
+	if err != nil {
+		return fmt.Errorf("open input: %w", err)
+	}
+	defer inFile.Close()
+
+	stat, err := inFile.Stat()
+	if err != nil {
+		return fmt.Errorf("stat input: %w", err)
+	}
+
+	zr, err := zip.NewReader(inFile, stat.Size())
+	if err != nil {
+		return fmt.Errorf("open zip: %w", err)
+	}
+
+	parts := make([]excelPart, 0, len(zr.File))
+	unique := make(map[string]struct{})
+	var sheetNames []string
+
+	for _, f := range zr.File {
+		rc, err := f.Open()
+		if err != nil {
+			return fmt.Errorf("read %s: %w", f.Name, err)
 		}
-		data, ok := v.([]byte)
-		if !ok {
-			return true
+		buf, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			return fmt.Errorf("read %s: %w", f.Name, err)
 		}
+
 		switch {
-		case strings.HasPrefix(name, "xl/drawings/drawing") && strings.HasSuffix(name, ".xml"):
-			if err := collectDrawingMLTexts(data, unique); err != nil && firstErr == nil {
-				firstErr = err
+		case f.Name == "xl/workbook.xml":
+			if err := extractWorkbookSheetNames(buf, unique, &sheetNames); err != nil {
+				return fmt.Errorf("parse workbook: %w", err)
 			}
-		case strings.HasPrefix(name, "xl/drawings/vmlDrawing") && strings.HasSuffix(name, ".vml"):
-			if err := collectVMLTexts(data, unique); err != nil && firstErr == nil {
-				firstErr = err
+		case f.Name == "xl/sharedStrings.xml":
+			if err := extractSharedStrings(buf, unique); err != nil {
+				return fmt.Errorf("parse sharedStrings: %w", err)
+			}
+		case isWorksheetXML(f.Name):
+			if err := extractInlineStrings(buf, unique); err != nil {
+				return fmt.Errorf("parse worksheet %s: %w", f.Name, err)
+			}
+		case isDrawingXML(f.Name):
+			if err := collectDrawingMLTexts(buf, unique); err != nil {
+				return fmt.Errorf("parse drawing %s: %w", f.Name, err)
+			}
+		case isVMLDrawing(f.Name):
+			if err := collectVMLTexts(buf, unique); err != nil {
+				return fmt.Errorf("parse vml %s: %w", f.Name, err)
 			}
 		}
-		return true
+
+		parts = append(parts, excelPart{
+			name:   f.Name,
+			data:   buf,
+			method: f.Method,
+		})
+	}
+
+	if len(unique) == 0 {
+		log.Println("nothing to translate")
+		return copyExcelZip(parts, output)
+	}
+
+	originals := make([]string, 0, len(unique))
+	for s := range unique {
+		originals = append(originals, s)
+	}
+	sort.Strings(originals)
+	log.Printf("unique texts: %d\n", len(originals))
+
+	translations := make(map[string]string)
+	ctx := context.Background()
+	for i := 0; i < len(originals); i += config.BatchSize {
+		end := i + config.BatchSize
+		if end > len(originals) {
+			end = len(originals)
+		}
+		batch := originals[i:end]
+		log.Printf("translating %d ~ %d ...", i+1, end)
+		part, err := translateBatch(ctx, batch, dir)
+		if err != nil {
+			return fmt.Errorf("translate: %w", err)
+		}
+		for k, v := range part {
+			translations[k] = v
+		}
+	}
+
+	sheetNameMap := buildSheetNameMap(sheetNames, translations)
+
+	for i, p := range parts {
+		switch {
+		case p.name == "xl/workbook.xml":
+			newXML, err := rewriteWorkbookSheetNames(p.data, sheetNameMap)
+			if err != nil {
+				return fmt.Errorf("rewrite workbook: %w", err)
+			}
+			parts[i].data = newXML
+		case p.name == "xl/sharedStrings.xml":
+			newXML, err := rewriteSharedStrings(p.data, translations)
+			if err != nil {
+				return fmt.Errorf("rewrite sharedStrings: %w", err)
+			}
+			parts[i].data = newXML
+		case isWorksheetXML(p.name):
+			newXML, err := rewriteInlineStrings(p.data, translations)
+			if err != nil {
+				return fmt.Errorf("rewrite worksheet %s: %w", p.name, err)
+			}
+			parts[i].data = newXML
+		case isDrawingXML(p.name):
+			newXML, _, err := replaceDrawingMLTexts(p.data, translations)
+			if err != nil {
+				return fmt.Errorf("rewrite drawing %s: %w", p.name, err)
+			}
+			parts[i].data = newXML
+		case isVMLDrawing(p.name):
+			newXML, _, err := replaceVMLTexts(p.data, translations)
+			if err != nil {
+				return fmt.Errorf("rewrite vml %s: %w", p.name, err)
+			}
+			parts[i].data = newXML
+		}
+	}
+
+	if err := copyExcelZip(parts, output); err != nil {
+		return err
+	}
+	log.Printf("wrote: %s", output)
+	return nil
+}
+
+func isWorksheetXML(name string) bool {
+	return strings.HasPrefix(name, "xl/worksheets/sheet") && strings.HasSuffix(name, ".xml")
+}
+
+func isDrawingXML(name string) bool {
+	return strings.HasPrefix(name, "xl/drawings/drawing") && strings.HasSuffix(name, ".xml")
+}
+
+func isVMLDrawing(name string) bool {
+	return strings.HasPrefix(name, "xl/drawings/vmlDrawing") && strings.HasSuffix(name, ".vml")
+}
+
+func extractWorkbookSheetNames(data []byte, unique map[string]struct{}, names *[]string) error {
+	dec := xml.NewDecoder(bytes.NewReader(data))
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		start, ok := tok.(xml.StartElement)
+		if !ok || start.Name.Local != "sheet" {
+			continue
+		}
+		for _, attr := range start.Attr {
+			if attr.Name.Local == "name" && attr.Value != "" {
+				unique[attr.Value] = struct{}{}
+				*names = append(*names, attr.Value)
+				break
+			}
+		}
+	}
+}
+
+func rewriteWorkbookSheetNames(data []byte, mapping map[string]string) ([]byte, error) {
+	s := string(data)
+	sheetTagRe := regexp.MustCompile(`(?s)<sheet\b[^>]*>`)
+	nameAttrRe := regexp.MustCompile(`\bname="([^"]*)"`)
+	out := sheetTagRe.ReplaceAllStringFunc(s, func(tag string) string {
+		loc := nameAttrRe.FindStringSubmatchIndex(tag)
+		if loc == nil {
+			return tag
+		}
+		name := tag[loc[2]:loc[3]]
+		if v, ok := mapping[name]; ok && v != "" {
+			return tag[:loc[2]] + v + tag[loc[3]:]
+		}
+		return tag
 	})
-	return firstErr
+	return []byte(out), nil
+}
+
+func extractSharedStrings(data []byte, unique map[string]struct{}) error {
+	dec := xml.NewDecoder(bytes.NewReader(data))
+	inSI := false
+	inT := false
+	var text strings.Builder
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			switch t.Name.Local {
+			case "si":
+				inSI = true
+				inT = false
+				text.Reset()
+			case "t":
+				if inSI {
+					inT = true
+				}
+			}
+		case xml.EndElement:
+			switch t.Name.Local {
+			case "t":
+				if inSI {
+					inT = false
+				}
+			case "si":
+				if inSI {
+					s := text.String()
+					if s != "" {
+						unique[s] = struct{}{}
+					}
+				}
+				inSI = false
+			}
+		case xml.CharData:
+			if inSI && inT {
+				text.Write([]byte(t))
+			}
+		}
+	}
+}
+
+func rewriteSharedStrings(data []byte, translations map[string]string) ([]byte, error) {
+	siRe := regexp.MustCompile(`(?s)<si\b[^>]*>.*?</si>`)
+	tRe := regexp.MustCompile(`(?s)<t\b[^>]*>(.*?)</t>`)
+	s := string(data)
+	out := siRe.ReplaceAllStringFunc(s, func(block string) string {
+		runs, ranges := extractTagRuns(block, tRe)
+		if len(runs) == 0 {
+			return block
+		}
+		orig := strings.Join(runs, "")
+		v, ok := translations[orig]
+		if !ok || v == "" {
+			return block
+		}
+		runOutputs := splitTranslatedRunsExcel(runs, v)
+		return replaceRanges(block, ranges, runOutputs)
+	})
+	return []byte(out), nil
+}
+
+func extractInlineStrings(data []byte, unique map[string]struct{}) error {
+	dec := xml.NewDecoder(bytes.NewReader(data))
+	inCell := false
+	cellInline := false
+	cellHasFormula := false
+	inIS := false
+	inT := false
+	var text strings.Builder
+
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if t.Name.Local == "c" {
+				inCell = true
+				cellInline = false
+				cellHasFormula = false
+				inIS = false
+				inT = false
+				text.Reset()
+				for _, attr := range t.Attr {
+					if attr.Name.Local == "t" && attr.Value == "inlineStr" {
+						cellInline = true
+						break
+					}
+				}
+				continue
+			}
+			if !inCell {
+				continue
+			}
+			switch t.Name.Local {
+			case "f":
+				cellHasFormula = true
+			case "is":
+				inIS = true
+			case "t":
+				if inIS {
+					inT = true
+				}
+			}
+		case xml.EndElement:
+			if !inCell {
+				continue
+			}
+			switch t.Name.Local {
+			case "t":
+				inT = false
+			case "is":
+				inIS = false
+			case "c":
+				if cellInline && !cellHasFormula {
+					s := text.String()
+					if s != "" {
+						unique[s] = struct{}{}
+					}
+				}
+				inCell = false
+			}
+		case xml.CharData:
+			if inCell && inIS && inT {
+				text.Write([]byte(t))
+			}
+		}
+	}
+}
+
+func rewriteInlineStrings(data []byte, translations map[string]string) ([]byte, error) {
+	cellRe := regexp.MustCompile(`(?s)<c\b[^>]*\bt="inlineStr"[^>]*>.*?</c>`)
+	tRe := regexp.MustCompile(`(?s)<t\b[^>]*>(.*?)</t>`)
+	s := string(data)
+	out := cellRe.ReplaceAllStringFunc(s, func(cell string) string {
+		if strings.Contains(cell, "<f") {
+			return cell
+		}
+		runs, ranges := extractTagRuns(cell, tRe)
+		if len(runs) == 0 {
+			return cell
+		}
+		orig := strings.Join(runs, "")
+		v, ok := translations[orig]
+		if !ok || v == "" {
+			return cell
+		}
+		runOutputs := splitTranslatedRunsExcel(runs, v)
+		return replaceRanges(cell, ranges, runOutputs)
+	})
+	return []byte(out), nil
 }
 
 func collectDrawingMLTexts(data []byte, unique map[string]struct{}) error {
@@ -219,177 +446,78 @@ func collectVMLTexts(data []byte, unique map[string]struct{}) error {
 	}
 }
 
-func applyDrawingTranslations(f *excelize.File, translations map[string]string) error {
-	var firstErr error
-	f.Pkg.Range(func(k, v interface{}) bool {
-		name, ok := k.(string)
-		if !ok {
-			return true
-		}
-		data, ok := v.([]byte)
-		if !ok {
-			return true
-		}
-		switch {
-		case strings.HasPrefix(name, "xl/drawings/drawing") && strings.HasSuffix(name, ".xml"):
-			updated, changed, err := replaceDrawingMLTexts(data, translations)
-			if err != nil {
-				if firstErr == nil {
-					firstErr = err
-				}
-				return true
-			}
-			if changed {
-				f.Pkg.Store(name, updated)
-			}
-		case strings.HasPrefix(name, "xl/drawings/vmlDrawing") && strings.HasSuffix(name, ".vml"):
-			updated, changed, err := replaceVMLTexts(data, translations)
-			if err != nil {
-				if firstErr == nil {
-					firstErr = err
-				}
-				return true
-			}
-			if changed {
-				f.Pkg.Store(name, updated)
-			}
-		}
-		return true
-	})
-	return firstErr
-}
-
 func replaceDrawingMLTexts(data []byte, translations map[string]string) ([]byte, bool, error) {
-	dec := xml.NewDecoder(bytes.NewReader(data))
-	var buf bytes.Buffer
-	enc := xml.NewEncoder(&buf)
-	inText := false
+	tRe := regexp.MustCompile(`(?s)<a:t\b[^>]*>(.*?)</a:t>`)
+	s := string(data)
+	matches := tRe.FindAllStringSubmatchIndex(s, -1)
+	if len(matches) == 0 {
+		return data, false, nil
+	}
+	var buf strings.Builder
+	last := 0
 	changed := false
-	for {
-		tok, err := dec.Token()
-		if err == io.EOF {
-			break
+	for _, m := range matches {
+		buf.WriteString(s[last:m[2]])
+		origRaw := s[m[2]:m[3]]
+		orig := html.UnescapeString(origRaw)
+		if v, ok := translations[orig]; ok && v != "" {
+			buf.WriteString(escapeXMLText(v))
+			changed = true
+		} else {
+			buf.WriteString(origRaw)
 		}
-		if err != nil {
-			return nil, false, err
-		}
-		switch t := tok.(type) {
-		case xml.StartElement:
-			if t.Name.Local == "t" && t.Name.Space == drawingMLNS {
-				inText = true
-			}
-			if err := enc.EncodeToken(t); err != nil {
-				return nil, false, err
-			}
-		case xml.EndElement:
-			if t.Name.Local == "t" && t.Name.Space == drawingMLNS {
-				inText = false
-			}
-			if err := enc.EncodeToken(t); err != nil {
-				return nil, false, err
-			}
-		case xml.CharData:
-			if inText {
-				if v, ok := translations[string(t)]; ok && v != "" {
-					t = xml.CharData([]byte(v))
-					changed = true
-				}
-			}
-			if err := enc.EncodeToken(t); err != nil {
-				return nil, false, err
-			}
-		default:
-			if err := enc.EncodeToken(t); err != nil {
-				return nil, false, err
-			}
-		}
+		last = m[3]
 	}
-	if err := enc.Flush(); err != nil {
-		return nil, false, err
-	}
-	return buf.Bytes(), changed, nil
+	buf.WriteString(s[last:])
+	return []byte(buf.String()), changed, nil
 }
 
 func replaceVMLTexts(data []byte, translations map[string]string) ([]byte, bool, error) {
-	dec := xml.NewDecoder(bytes.NewReader(data))
-	var buf bytes.Buffer
-	enc := xml.NewEncoder(&buf)
-	inTextBox := false
+	boxRe := regexp.MustCompile(`(?s)<v:textbox\b[^>]*>.*?</v:textbox>`)
+	s := string(data)
 	changed := false
-	for {
-		tok, err := dec.Token()
-		if err == io.EOF {
-			break
+	out := boxRe.ReplaceAllStringFunc(s, func(box string) string {
+		start := strings.Index(box, ">")
+		end := strings.LastIndex(box, "</v:textbox>")
+		if start == -1 || end == -1 || start+1 > end {
+			return box
 		}
-		if err != nil {
-			return nil, false, err
+		inner := box[start+1 : end]
+		runs, ranges := extractTextRuns(inner)
+		if len(runs) == 0 {
+			return box
 		}
-		switch t := tok.(type) {
-		case xml.StartElement:
-			if t.Name.Local == "textbox" && (t.Name.Space == vmlNS || t.Name.Space == "") {
-				inTextBox = true
-			}
-			if err := enc.EncodeToken(t); err != nil {
-				return nil, false, err
-			}
-		case xml.EndElement:
-			if t.Name.Local == "textbox" && (t.Name.Space == vmlNS || t.Name.Space == "") {
-				inTextBox = false
-			}
-			if err := enc.EncodeToken(t); err != nil {
-				return nil, false, err
-			}
-		case xml.CharData:
-			if inTextBox {
-				trimmed := strings.TrimSpace(string(t))
-				if trimmed != "" {
-					if v, ok := translations[trimmed]; ok && v != "" {
-						t = xml.CharData([]byte(v))
-						changed = true
-					}
-				}
-			}
-			if err := enc.EncodeToken(t); err != nil {
-				return nil, false, err
-			}
-		default:
-			if err := enc.EncodeToken(t); err != nil {
-				return nil, false, err
-			}
+		orig := strings.Join(runs, "")
+		v, ok := translations[orig]
+		if !ok || v == "" {
+			return box
 		}
-	}
-	if err := enc.Flush(); err != nil {
-		return nil, false, err
-	}
-	return buf.Bytes(), changed, nil
+		runOutputs := splitTranslatedRunsExcel(runs, v)
+		newInner := replaceRanges(inner, ranges, runOutputs)
+		if newInner != inner {
+			changed = true
+		}
+		return box[:start+1] + newInner + box[end:]
+	})
+	return []byte(out), changed, nil
 }
 
-func applySheetNameTranslations(f *excelize.File, translations map[string]string) {
+func buildSheetNameMap(names []string, translations map[string]string) map[string]string {
+	mapping := make(map[string]string, len(names))
 	used := make(map[string]struct{})
-	for _, name := range f.GetSheetList() {
-		used[name] = struct{}{}
-	}
-
-	for _, name := range f.GetSheetList() {
-		newName, ok := translations[name]
-		if !ok || newName == "" || newName == name {
-			continue
+	for _, name := range names {
+		target := name
+		if v, ok := translations[name]; ok && v != "" {
+			v = sanitizeSheetName(v)
+			if v != "" {
+				target = v
+			}
 		}
-		newName = sanitizeSheetName(newName)
-		if newName == "" || newName == name {
-			continue
-		}
-		target := makeUniqueSheetName(newName, used)
-		if target == name {
-			continue
-		}
-		if err := f.SetSheetName(name, target); err != nil {
-			logf(levelWarn, "rename sheet %s -> %s failed: %v", name, target, err)
-			continue
-		}
-		delete(used, name)
+		target = makeUniqueSheetName(target, used)
+		mapping[name] = target
 		used[target] = struct{}{}
 	}
+	return mapping
 }
 
 func sanitizeSheetName(name string) string {
@@ -427,4 +555,137 @@ func truncateRunes(s string, max int) string {
 		return s
 	}
 	return string(r[:max])
+}
+
+func splitTranslatedRunsExcel(origRuns []string, translated string) [][]byte {
+	if len(origRuns) == 0 {
+		return nil
+	}
+	tr := []rune(translated)
+	total := 0
+	runLens := make([]int, len(origRuns))
+	for i, s := range origRuns {
+		runLens[i] = len([]rune(s))
+		total += runLens[i]
+	}
+	if total == 0 {
+		for i := range runLens {
+			runLens[i] = 1
+		}
+		total = len(origRuns)
+	}
+
+	res := make([][]byte, len(origRuns))
+	offset := 0
+	for i, ln := range runLens {
+		share := len(tr) * ln / total
+		if i == len(runLens)-1 {
+			share = len(tr) - offset
+			if share < 0 {
+				share = 0
+			}
+		}
+		res[i] = []byte(string(tr[offset : offset+share]))
+		offset += share
+	}
+	return res
+}
+
+func escapeXMLText(s string) string {
+	var buf bytes.Buffer
+	_ = xml.EscapeText(&buf, []byte(s))
+	return buf.String()
+}
+
+func extractTagRuns(block string, tRe *regexp.Regexp) ([]string, [][]int) {
+	matches := tRe.FindAllStringSubmatchIndex(block, -1)
+	runs := make([]string, 0, len(matches))
+	ranges := make([][]int, 0, len(matches))
+	for _, m := range matches {
+		if len(m) < 4 {
+			continue
+		}
+		raw := block[m[2]:m[3]]
+		runs = append(runs, html.UnescapeString(raw))
+		ranges = append(ranges, []int{m[2], m[3]})
+	}
+	return runs, ranges
+}
+
+func extractTextRuns(block string) ([]string, [][]int) {
+	var runs []string
+	var ranges [][]int
+	inTag := false
+	start := 0
+	for i := 0; i < len(block); i++ {
+		switch block[i] {
+		case '<':
+			if !inTag && start < i {
+				raw := block[start:i]
+				runs = append(runs, html.UnescapeString(raw))
+				ranges = append(ranges, []int{start, i})
+			}
+			inTag = true
+		case '>':
+			if inTag {
+				inTag = false
+				start = i + 1
+			}
+		}
+	}
+	if !inTag && start < len(block) {
+		raw := block[start:]
+		runs = append(runs, html.UnescapeString(raw))
+		ranges = append(ranges, []int{start, len(block)})
+	}
+	return runs, ranges
+}
+
+func replaceRanges(block string, ranges [][]int, runs [][]byte) string {
+	var buf strings.Builder
+	last := 0
+	for i, r := range ranges {
+		if len(r) < 2 {
+			continue
+		}
+		buf.WriteString(block[last:r[0]])
+		if i < len(runs) {
+			buf.WriteString(escapeXMLText(string(runs[i])))
+		}
+		last = r[1]
+	}
+	buf.WriteString(block[last:])
+	return buf.String()
+}
+
+func copyExcelZip(parts []excelPart, output string) error {
+	outFile, err := os.Create(output)
+	if err != nil {
+		return fmt.Errorf("create output: %w", err)
+	}
+	defer outFile.Close()
+
+	zw := zip.NewWriter(outFile)
+	for _, p := range parts {
+		h := &zip.FileHeader{
+			Name:   p.name,
+			Method: p.method,
+		}
+		if strings.HasSuffix(p.name, "/") || path.Base(p.name) == "" {
+			h.Method = zip.Store
+		}
+		w, err := zw.CreateHeader(h)
+		if err != nil {
+			zw.Close()
+			return fmt.Errorf("write %s header: %w", p.name, err)
+		}
+		if _, err := w.Write(p.data); err != nil {
+			zw.Close()
+			return fmt.Errorf("write %s data: %w", p.name, err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		return fmt.Errorf("finalize zip: %w", err)
+	}
+	return nil
 }
