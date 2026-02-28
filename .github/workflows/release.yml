@@ -74,9 +74,19 @@ jobs:
           name: translate_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}
           path: dist/translate_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}.${{ matrix.archive }}
 
-      - name: Publish Release Asset
-        if: startsWith(github.ref, 'refs/tags/')
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Publish Release Assets
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/translate_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}.${{ matrix.archive }}
+          files: release-assets/**/*
           generate_release_notes: true
