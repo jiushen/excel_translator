@@ -85,19 +85,18 @@ chmod +x scripts/release.sh
 ./scripts/release.sh v1.0.0
 ```
 
-如果要自定义提交信息：
-
-```bash
-./scripts/release.sh v1.0.1 "fix: preserve pptx xml namespaces"
-```
-
 脚本会自动执行以下步骤：
 
-1. 使用 `git add -A` 暂存所有变更
-2. 如果存在未提交变更，则自动创建提交
-3. 推送当前分支到 `origin`
-4. 创建一个带注释的 tag
-5. 将该 tag 推送到 `origin`
+1. 检查当前分支状态
+2. 推送当前分支的已提交内容到 `origin`
+3. 基于当前 `HEAD` 创建一个带注释的 tag
+4. 将该 tag 推送到 `origin`
+
+注意：
+
+- 脚本不会执行 `git add` 或 `git commit`
+- 如果本地还有未提交修改，脚本会提示，但发版仍然只基于当前已经提交的 `HEAD`
+- 目录中未跟踪或无关文件不会被自动提交到 git
 
 ### GitHub Actions 自动构建
 

@@ -5,18 +5,16 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  ./scripts/release.sh <version> [commit message]
+  ./scripts/release.sh <version>
 
 Examples:
   ./scripts/release.sh v1.0.0
-  ./scripts/release.sh v1.0.1 "fix: preserve pptx xml namespaces"
 
 Behavior:
-  1. Stage all changes
-  2. Commit if there are changes
-  3. Push the current branch
-  4. Create an annotated tag
-  5. Push the tag to origin
+  1. Verify the current branch
+  2. Push the current branch HEAD
+  3. Create an annotated tag from the current HEAD commit
+  4. Push the tag to origin
 
 The GitHub Actions workflow will build release binaries after the tag is pushed.
 EOF
@@ -33,7 +31,6 @@ if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
 fi
 
 version="$1"
-commit_message="${2:-release: ${version}}"
 
 if git rev-parse --verify --quiet "${version}" >/dev/null; then
   echo "error: tag ${version} already exists" >&2
@@ -46,12 +43,8 @@ if [[ "${branch}" == "HEAD" ]]; then
   exit 1
 fi
 
-git add -A
-
-if ! git diff --cached --quiet; then
-  git commit -m "${commit_message}"
-else
-  echo "no staged changes to commit, continuing with existing HEAD"
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  echo "warning: working tree has uncommitted changes; release will use the current committed HEAD only"
 fi
 
 git push origin "${branch}"
