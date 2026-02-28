@@ -6,10 +6,12 @@ import (
 	"context"
 	"encoding/xml"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"os"
 	"path"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -165,130 +167,65 @@ func extractTexts(xmlData []byte, dst map[string]struct{}) {
 	}
 }
 
-// rewriteTexts replaces paragraph-level text; first <a:t> in a paragraph is replaced with the translated full paragraph, other runs are emptied.
+// rewriteTexts replaces only the text inside existing <a:t> nodes.
+// It preserves the original XML bytes outside those text ranges.
 func rewriteTexts(xmlData []byte, translations map[string]string) ([]byte, error) {
-	dec := xml.NewDecoder(bytes.NewReader(xmlData))
-	var buf bytes.Buffer
-	enc := xml.NewEncoder(&buf)
-	inP := false
-	inText := false
-	var para strings.Builder
-	var paraTokens []xml.Token
-	var runTexts []string
-
-	for {
-		tok, err := dec.Token()
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return nil, err
+	pRe := regexp.MustCompile(`(?s)<a:p\b[^>]*>.*?</a:p>`)
+	tRe := regexp.MustCompile(`(?s)<a:t\b[^>]*>(.*?)</a:t>`)
+	brRe := regexp.MustCompile(`(?s)<a:br\b[^>]*/>|<a:br\b[^>]*>\s*</a:br>`)
+	s := string(xmlData)
+	out := pRe.ReplaceAllStringFunc(s, func(block string) string {
+		runs, ranges := extractPPTTagRuns(block, tRe)
+		if len(runs) == 0 {
+			return block
 		}
-		switch t := tok.(type) {
-		case xml.StartElement:
-			if t.Name.Local == "p" {
-				inP = true
-				para.Reset()
-				paraTokens = paraTokens[:0]
-				runTexts = runTexts[:0]
-			}
-			if inP && t.Name.Local == "t" {
-				inText = true
-			}
-			if inP && t.Name.Local == "br" {
-				para.WriteString("\n")
-			}
-			if inP {
-				paraTokens = append(paraTokens, t)
-			} else {
-				if err := enc.EncodeToken(t); err != nil {
-					return nil, err
-				}
-			}
-		case xml.EndElement:
-			if inP {
-				paraTokens = append(paraTokens, t)
-				if t.Name.Local == "t" {
-					inText = false
-				}
-				if t.Name.Local == "p" {
-					inP = false
-					if err := emitParagraph(enc, paraTokens, runTexts, translations, strings.TrimSpace(para.String())); err != nil {
-						return nil, err
-					}
-				}
-			} else {
-				if err := enc.EncodeToken(t); err != nil {
-					return nil, err
-				}
-			}
-		case xml.CharData:
-			if inP {
-				if inText {
-					txt := string([]byte(t))
-					runTexts = append(runTexts, txt)
-					para.WriteString(txt)
-				}
-				paraTokens = append(paraTokens, t)
-			} else {
-				if err := enc.EncodeToken(t); err != nil {
-					return nil, err
-				}
-			}
-		default:
-			if inP {
-				paraTokens = append(paraTokens, t)
-			} else {
-				if err := enc.EncodeToken(t); err != nil {
-					return nil, err
-				}
-			}
+		key := pptParagraphKey(block, tRe, brRe)
+		v, ok := translations[key]
+		if !ok || v == "" {
+			return block
 		}
-	}
-	if err := enc.Flush(); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+		runOutputs := splitTranslatedRuns(runs, v)
+		return replacePPTRanges(block, ranges, runOutputs)
+	})
+	return []byte(out), nil
 }
 
-func emitParagraph(enc *xml.Encoder, tokens []xml.Token, runTexts []string, translations map[string]string, key string) error {
-	runOutputs := splitTranslatedRuns(runTexts, translations[key])
-	runIdx := 0
-	inText := false
-	for _, tok := range tokens {
-		switch t := tok.(type) {
-		case xml.StartElement:
-			if t.Name.Local == "t" {
-				inText = true
-			}
-			if err := enc.EncodeToken(t); err != nil {
-				return err
-			}
-		case xml.EndElement:
-			if t.Name.Local == "t" {
-				inText = false
-			}
-			if err := enc.EncodeToken(t); err != nil {
-				return err
-			}
-		case xml.CharData:
-			if inText && runIdx < len(runOutputs) {
-				if err := enc.EncodeToken(xml.CharData(runOutputs[runIdx])); err != nil {
-					return err
-				}
-				runIdx++
-			} else {
-				if err := enc.EncodeToken(t); err != nil {
-					return err
-				}
-			}
-		default:
-			if err := enc.EncodeToken(tok); err != nil {
-				return err
-			}
+func pptParagraphKey(block string, tRe, brRe *regexp.Regexp) string {
+	normalized := brRe.ReplaceAllString(block, "\n")
+	runs, _ := extractPPTTagRuns(normalized, tRe)
+	return strings.TrimSpace(strings.Join(runs, ""))
+}
+
+func extractPPTTagRuns(block string, tRe *regexp.Regexp) ([]string, [][]int) {
+	matches := tRe.FindAllStringSubmatchIndex(block, -1)
+	runs := make([]string, 0, len(matches))
+	ranges := make([][]int, 0, len(matches))
+	for _, m := range matches {
+		if len(m) < 4 {
+			continue
 		}
+		raw := block[m[2]:m[3]]
+		runs = append(runs, html.UnescapeString(raw))
+		ranges = append(ranges, []int{m[2], m[3]})
 	}
-	return nil
+	return runs, ranges
+}
+
+func replacePPTRanges(block string, ranges [][]int, runs [][]byte) string {
+	var buf strings.Builder
+	last := 0
+	for i, r := range ranges {
+		if len(r) < 2 {
+			continue
+		}
+		buf.WriteString(block[last:r[0]])
+		if i < len(runs) {
+			buf.WriteString(escapeXMLText(string(runs[i])))
+		}
+		last = r[1]
+	}
+	buf.WriteString(block[last:])
+	return buf.String()
 }
 
 func splitTranslatedRuns(origRuns []string, translated string) [][]byte {
