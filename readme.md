@@ -103,9 +103,7 @@ chmod +x scripts/release.sh
 当推送符合 `v*` 规则的 tag（例如 `v1.0.0`）后，GitHub Actions 会自动构建以下平台版本：
 
 - Windows `amd64`
-- Windows `arm64`
 - Linux `amd64`
-- Linux `arm64`
 - macOS `amd64`
 - macOS `arm64`（Apple Silicon / M 系列）
 

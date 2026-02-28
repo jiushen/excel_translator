@@ -20,16 +20,8 @@ jobs:
             goarch: amd64
             archive: zip
             ext: .exe
-          - goos: windows
-            goarch: arm64
-            archive: zip
-            ext: .exe
           - goos: linux
             goarch: amd64
-            archive: tar.gz
-            ext: ""
-          - goos: linux
-            goarch: arm64
             archive: tar.gz
             ext: ""
           - goos: darwin
