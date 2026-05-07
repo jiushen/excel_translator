@@ -2,12 +2,12 @@ provider: deepseek
 
 # OpenAI settings (leave empty if unused)
 openai_key: "***REMOVED***"
-openai_model: "gpt-5.2"
+openai_model: "gpt-5.5"
 openai_url: "https://api.openai.com/v1/chat/completions"
 
 # DeepSeek settings
 deepseek_key: "***REMOVED***"
-deepseek_model: "deepseek-chat"
+deepseek_model: "deepseek-v4-flash"
 deepseek_url: "https://api.deepseek.com/v1/chat/completions"
 
 # batch size for translation requests
