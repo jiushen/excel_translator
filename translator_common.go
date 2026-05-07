@@ -225,9 +225,182 @@ func callChatAPI(ctx context.Context, texts []string, dir Direction, baseURL, ap
 	content := cr.Choices[0].Message.Content
 	out := make(map[string]string)
 	if err := json.Unmarshal([]byte(content), &out); err != nil {
+		// LLM sometimes produces unescaped quotes inside JSON string values.
+		// Attempt to fix by re-extracting from the raw JSON response where the
+		// outer envelope already has proper escaping.
+		fixed := tryFixLLMJSON(content)
+		if fixed != "" {
+			if err2 := json.Unmarshal([]byte(fixed), &out); err2 == nil {
+				logf(levelWarn, "LLM returned malformed JSON, auto-fixed successfully")
+				return out, nil
+			}
+		}
 		return nil, fmt.Errorf("unmarshal model JSON: %w\nraw: %s", err, content)
 	}
 	return out, nil
+}
+
+// tryFixLLMJSON attempts to repair JSON where the LLM produced unescaped
+// double-quotes inside string values. It uses a simple heuristic: if a `"`
+// appears to close a string but the next non-whitespace char is NOT one of
+// `,`, `}`, `]`, or `:`, then that `"` was likely an unescaped interior quote
+// and should be escaped as `\"`.
+func tryFixLLMJSON(raw string) string {
+	runes := []rune(raw)
+	n := len(runes)
+	if n == 0 {
+		return ""
+	}
+
+	var buf strings.Builder
+	buf.Grow(len(raw) + 64)
+
+	i := 0
+	// skip leading whitespace
+	for i < n && (runes[i] == ' ' || runes[i] == '\t' || runes[i] == '\n' || runes[i] == '\r') {
+		buf.WriteRune(runes[i])
+		i++
+	}
+	if i >= n || runes[i] != '{' {
+		return ""
+	}
+	buf.WriteRune(runes[i])
+	i++
+
+	// state machine: walk through top-level object
+	for i < n {
+		// skip whitespace
+		for i < n && isJSONWhitespace(runes[i]) {
+			buf.WriteRune(runes[i])
+			i++
+		}
+		if i >= n {
+			break
+		}
+		if runes[i] == '}' {
+			buf.WriteRune(runes[i])
+			return buf.String()
+		}
+		// expect a key string
+		if runes[i] != '"' {
+			return "" // can't fix
+		}
+		i = copyJSONString(&buf, runes, i)
+		if i < 0 {
+			return ""
+		}
+		// skip whitespace, expect ':'
+		for i < n && isJSONWhitespace(runes[i]) {
+			buf.WriteRune(runes[i])
+			i++
+		}
+		if i >= n || runes[i] != ':' {
+			return ""
+		}
+		buf.WriteRune(':')
+		i++
+		// skip whitespace, expect value string
+		for i < n && isJSONWhitespace(runes[i]) {
+			buf.WriteRune(runes[i])
+			i++
+		}
+		if i >= n || runes[i] != '"' {
+			return "" // non-string value, bail
+		}
+		// For values, use lenient string copy that handles unescaped quotes
+		i = copyJSONStringLenient(&buf, runes, i)
+		if i < 0 {
+			return ""
+		}
+		// skip whitespace, expect ',' or '}'
+		for i < n && isJSONWhitespace(runes[i]) {
+			buf.WriteRune(runes[i])
+			i++
+		}
+		if i >= n {
+			break
+		}
+		if runes[i] == ',' {
+			buf.WriteRune(',')
+			i++
+		} else if runes[i] == '}' {
+			buf.WriteRune('}')
+			return buf.String()
+		} else {
+			return ""
+		}
+	}
+	return ""
+}
+
+func isJSONWhitespace(r rune) bool {
+	return r == ' ' || r == '\t' || r == '\n' || r == '\r'
+}
+
+// copyJSONString copies a standard JSON string (key) from runes[start] into buf.
+// Returns the index after the closing quote, or -1 on error.
+func copyJSONString(buf *strings.Builder, runes []rune, start int) int {
+	if runes[start] != '"' {
+		return -1
+	}
+	buf.WriteRune('"')
+	i := start + 1
+	for i < len(runes) {
+		if runes[i] == '\\' && i+1 < len(runes) {
+			buf.WriteRune(runes[i])
+			buf.WriteRune(runes[i+1])
+			i += 2
+		} else if runes[i] == '"' {
+			buf.WriteRune('"')
+			return i + 1
+		} else {
+			buf.WriteRune(runes[i])
+			i++
+		}
+	}
+	return -1
+}
+
+// copyJSONStringLenient copies a JSON string value, tolerating unescaped quotes.
+// If a `"` is encountered and the next non-ws char is NOT `,`, `}`, or end-of-input,
+// treat it as an interior quote that should be escaped.
+func copyJSONStringLenient(buf *strings.Builder, runes []rune, start int) int {
+	if runes[start] != '"' {
+		return -1
+	}
+	buf.WriteRune('"')
+	i := start + 1
+	n := len(runes)
+	for i < n {
+		if runes[i] == '\\' && i+1 < n {
+			buf.WriteRune(runes[i])
+			buf.WriteRune(runes[i+1])
+			i += 2
+		} else if runes[i] == '"' {
+			// Look ahead: is this the real end of the string?
+			j := i + 1
+			for j < n && isJSONWhitespace(runes[j]) {
+				j++
+			}
+			if j >= n || runes[j] == ',' || runes[j] == '}' || runes[j] == ']' {
+				// This is the real closing quote
+				buf.WriteRune('"')
+				return i + 1
+			}
+			// Check if it looks like a new key starts: "..." : (next key pattern)
+			// Pattern: `"` <whitespace> `,` means end of value
+			// Pattern: `"` <whitespace> `}` means end of object
+			// Otherwise: it's an unescaped interior quote
+			buf.WriteString(`\"`)
+			i++
+		} else {
+			buf.WriteRune(runes[i])
+			i++
+		}
+	}
+	// Reached end without closing quote, force close
+	buf.WriteRune('"')
+	return n
 }
 
 type chatRequest struct {
