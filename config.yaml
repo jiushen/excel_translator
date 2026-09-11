@@ -1,12 +1,12 @@
 provider: deepseek
 
 # OpenAI settings (leave empty if unused)
-openai_key: "***REMOVED***"
+openai_key: ""  # or set OPENAI_API_KEY env var
 openai_model: "gpt-5.5"
 openai_url: "https://api.openai.com/v1/chat/completions"
 
 # DeepSeek settings
-deepseek_key: "***REMOVED***"
+deepseek_key: ""  # or set DEEPSEEK_API_KEY env var
 deepseek_model: "deepseek-v4-flash"
 deepseek_url: "https://api.deepseek.com/v1/chat/completions"
 

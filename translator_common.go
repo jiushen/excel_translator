@@ -66,6 +66,13 @@ func loadConfig(path string) error {
 		return err
 	}
 	config = cfg
+	// Secrets come from environment first; config file values are only a fallback.
+	if v := os.Getenv("OPENAI_API_KEY"); v != "" {
+		config.OpenAIKey = v
+	}
+	if v := os.Getenv("DEEPSEEK_API_KEY"); v != "" {
+		config.DeepseekKey = v
+	}
 	if config.BatchSize <= 0 {
 		config.BatchSize = 50
 	}
